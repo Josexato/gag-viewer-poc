@@ -1,0 +1,254 @@
+"""
+AlmaGag.draw.container
+
+Este módulo maneja el dibujo de elementos contenedores (containers) que pueden
+agrupar otros elementos dentro de ellos.
+
+Los contenedores se representan como rectángulos con bordes redondeados que
+contienen otros elementos, permitiendo agrupar conceptos visuales.
+
+Autor: José + ALMA
+Fecha: 2026-01-07
+"""
+
+import logging
+
+from AlmaGag.config import (
+    ICON_WIDTH, ICON_HEIGHT, CONTAINER_PADDING, TEXT_CHAR_WIDTH, TEXT_LINE_HEIGHT,
+    CONTAINER_FILL_OPACITY, CONTAINER_STROKE_OPACITY,
+)
+from AlmaGag.draw.icons import create_gradient
+
+logger = logging.getLogger('AlmaGag')
+from AlmaGag.utils import extract_item_id, calculate_label_dimensions
+import importlib
+
+
+def calculate_container_bounds(container, elements_by_id):
+    """
+    Calcula automáticamente el bounding box de un contenedor basado en
+    los elementos que contiene.
+
+    Parámetros:
+        container (dict): Elemento contenedor con campo 'contains'.
+        elements_by_id (dict): Mapa de id → elemento.
+
+    Retorna:
+        dict: {'x': x_min, 'y': y_min, 'width': width, 'height': height}
+    """
+    contains = container.get('contains', [])
+    if not contains:
+        # Sin elementos contenidos, usar tamaño por defecto
+        return {
+            'x': container.get('x', 0),
+            'y': container.get('y', 0),
+            'width': 200,
+            'height': 150
+        }
+
+    # Obtener padding (espacio interno)
+    padding = container.get('padding', 10)
+
+    # Encontrar bounds de todos los elementos contenidos
+    min_x = float('inf')
+    min_y = float('inf')
+    max_x = float('-inf')
+    max_y = float('-inf')
+
+    for item in contains:
+        # Soportar formato dict {"id": "...", "scope": "..."} o string directo
+        elem_id = extract_item_id(item)
+
+        if elem_id not in elements_by_id:
+            continue
+
+        elem = elements_by_id[elem_id]
+        elem_x = elem.get('x', 0)
+        elem_y = elem.get('y', 0)
+        elem_w = elem.get('width', ICON_WIDTH)
+        elem_h = elem.get('height', ICON_HEIGHT)
+
+        min_x = min(min_x, elem_x)
+        min_y = min(min_y, elem_y)
+        max_x = max(max_x, elem_x + elem_w)
+        max_y = max(max_y, elem_y + elem_h)
+
+        # Considerar etiqueta del elemento contenido
+        if elem.get('label'):
+            label_w, label_h, lines = calculate_label_dimensions(elem['label'])
+            # Etiqueta centrada debajo del elemento (posición por defecto)
+            label_cx = elem_x + elem_w / 2
+            label_y = elem_y + elem_h + 15  # 15px gap
+            label_x1 = label_cx - label_w / 2
+            label_x2 = label_cx + label_w / 2
+            min_x = min(min_x, label_x1)
+            max_x = max(max_x, label_x2)
+            max_y = max(max_y, label_y + label_h)
+
+    # Aplicar padding
+    min_x -= padding
+    min_y -= padding
+    max_x += padding
+    max_y += padding
+
+    width = max_x - min_x
+    height = max_y - min_y
+
+    # BUGS-AUTO-007: garantizar ancho mínimo para que el label del header
+    # del container quepa dentro del rect. El label se renderiza con anchor
+    # 'start' desde container.x + 10 + ICON_WIDTH + 10 (deja espacio para
+    # el icono header), así que el ancho necesario es:
+    #   10 (margen izq) + ICON_WIDTH + 10 (gap) + label_width + 10 (margen der)
+    # Sin esto el header de containers como 'Shared (algoritmo-agnóstico)'
+    # se salía 40+px por el borde derecho. LAF ya tenía este chequeo en
+    # container_grower; AUTO usa esta función y no lo tenía.
+    if container.get('label'):
+        label_text = container['label']
+        lines = label_text.split('\n')
+        max_line_len = max((len(line) for line in lines), default=0)
+        # Bold 16px aprox 10px/char (más conservador que el 8 estándar)
+        label_width = max_line_len * 10
+        min_width_for_label = 10 + ICON_WIDTH + 10 + label_width + 10
+        if min_width_for_label > width:
+            extra = min_width_for_label - width
+            max_x += extra
+            width = min_width_for_label
+
+    # Aplicar aspect_ratio si se especifica
+    aspect_ratio = container.get('aspect_ratio')
+    if aspect_ratio:
+        current_ratio = width / height if height > 0 else 1
+        if current_ratio < aspect_ratio:
+            # Ensanchar
+            new_width = height * aspect_ratio
+            min_x -= (new_width - width) / 2
+            width = new_width
+        elif current_ratio > aspect_ratio:
+            # Alargar
+            new_height = width / aspect_ratio
+            min_y -= (new_height - height) / 2
+            height = new_height
+
+    return {
+        'x': min_x,
+        'y': min_y,
+        'width': width,
+        'height': height
+    }
+
+
+def draw_container(dwg, container, elements_by_id, draw_label=True, layout_algorithm='auto', draw_icon=True):
+    """
+    Dibuja un elemento contenedor como un rectángulo con bordes redondeados
+    y un ícono en la esquina superior izquierda.
+
+    Parámetros:
+        dwg (svgwrite.Drawing): Objeto SVG donde se dibuja.
+        container (dict): Elemento contenedor con:
+            - 'contains': lista de elementos contenidos
+            - 'x', 'y', 'width', 'height': dimensiones pre-calculadas (v2.2+)
+            - 'type' (opcional): tipo de ícono para esquina superior izquierda
+            - 'label' (opcional): etiqueta del contenedor
+            - 'color' (opcional): color del contenedor
+            - 'aspect_ratio' (opcional): proporción width/height
+            - 'padding' (opcional): espacio interno (default: 10)
+        elements_by_id (dict): Mapa de id → elemento.
+        draw_label (bool): Si es False, no dibuja la etiqueta del contenedor.
+                          Útil cuando la etiqueta se maneja externamente (default: True).
+        layout_algorithm (str): Algoritmo de layout usado ('auto' o 'laf').
+                               Si es 'laf', NO dibuja el ícono de la esquina porque
+                               LAF maneja el ícono del contenedor como elemento separado.
+    """
+    # IMPORTANTE (v2.2+): Usar dimensiones pre-calculadas si existen.
+    # container_calculator ya calculó las dimensiones considerando
+    # TANTO íconos como etiquetas de elementos contenidos.
+    # Solo recalcular si no existen (fallback para compatibilidad).
+    if '_is_container_calculated' in container and all(k in container for k in ['x', 'y', 'width', 'height']):
+        # Usar dimensiones ya calculadas (incluyen etiquetas)
+        x = container['x']
+        y = container['y']
+        width = container['width']
+        height = container['height']
+    else:
+        # Fallback: calcular bounds (solo para retrocompatibilidad)
+        bounds = calculate_container_bounds(container, elements_by_id)
+        x = bounds['x']
+        y = bounds['y']
+        width = bounds['width']
+        height = bounds['height']
+        logger.debug(f"[CALC_BOUNDS] {container['id']}: calculated=({x:.1f}, {y:.1f}) vs container=({container.get('x', 'N/A')}, {container.get('y', 'N/A')})")
+
+    # Calcular radio de bordes redondeados (5% del lado más corto)
+    radius = min(width, height) * 0.05
+
+    # Obtener color
+    color = container.get('color', 'lightgray')
+
+    # Crear gradiente para el contenedor
+    gradient_id = create_gradient(dwg, container['id'], color)
+
+    # Dibujar rectángulo con bordes redondeados.
+    # fill_opacity bajo: deja ver los hijos detrás del contenedor.
+    # stroke_opacity alto: borde nítido para percibir el agrupamiento.
+    # (Antes se usaba opacity=0.3 global, que dejaba el borde casi invisible.)
+    rect = dwg.rect(
+        insert=(x, y),
+        size=(width, height),
+        rx=radius,
+        ry=radius,
+        fill=gradient_id,  # create_gradient ya retorna url(#...)
+        fill_opacity=CONTAINER_FILL_OPACITY,
+        stroke='black',
+        stroke_width=2,
+        stroke_opacity=CONTAINER_STROKE_OPACITY,
+    )
+    dwg.add(rect)
+
+    # Dibujar ícono en esquina superior izquierda
+    if draw_icon:
+        icon_type = container.get('type', 'building')
+        icon_size = min(ICON_WIDTH, ICON_HEIGHT) * 0.6  # Ícono más pequeño
+        icon_x = x + CONTAINER_PADDING  # Padding left
+        icon_y = y + CONTAINER_PADDING  # Padding top
+
+        # Intentar cargar módulo del ícono
+        try:
+            icon_module = importlib.import_module(f'AlmaGag.draw.icons.{icon_type}')
+            # Obtener función específica draw_<type>
+            draw_func = getattr(icon_module, f'draw_{icon_type}')
+            # Dibujar ícono (el módulo crea su propio gradiente)
+            icon_elem_id = f"{container['id']}_icon"
+            draw_func(dwg, icon_x, icon_y, color, icon_elem_id)
+        except (ImportError, AttributeError) as e:
+            # Fallback: dibujar rectángulo simple
+            dwg.add(dwg.rect(
+                insert=(icon_x, icon_y),
+                size=(icon_size, icon_size),
+                fill=gradient_id,  # create_gradient ya retorna url(#...)
+                stroke='black',
+                opacity=1.0
+            ))
+
+    # Dibujar etiqueta del contenedor (si existe y draw_label=True)
+    if draw_label:
+        label = container.get('label', '')
+        if label:
+            # CRÍTICO: El contenedor YA tiene espacio reservado arriba (container_calculator expandió y hacia arriba)
+            # Dibujar label DENTRO del header reservado, no fuera
+            lines = label.split('\n')
+            label_height = len(lines) * TEXT_LINE_HEIGHT + 10
+
+            label_x = x + width / 2
+            # label_y_base: dentro del header reservado
+            label_y_base = y + label_height - 10
+
+            for i, line in enumerate(lines):
+                dwg.add(dwg.text(
+                    line,
+                    insert=(label_x, label_y_base - (len(lines) - 1 - i) * TEXT_LINE_HEIGHT),
+                    text_anchor="middle",
+                    font_size="16px",
+                    font_family="Arial, sans-serif",
+                    font_weight="bold",
+                    fill="black"
+                ))

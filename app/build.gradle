@@ -1,0 +1,50 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.poc.gagviewer'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.poc.gagviewer'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+
+        // Chaquopy empaqueta el runtime de Python por ABI. Limitamos a las
+        // arquitecturas reales de teléfono para no inflar el APK.
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Firmado con la signingConfig debug: instalable sin keystore propio.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        // Versión de Python embebida (AlmaGag requiere 3.8+).
+        version '3.11'
+        // Intérprete del host usado en build para resolver pip/empaquetar.
+        // En CI (ubuntu) y en Windows local suele resolverse como 'python3'/'python'.
+        buildPython 'python3', 'python'
+        pip {
+            install 'svgwrite>=1.4'
+        }
+    }
+    // Las fuentes Python por defecto se toman de src/main/python
+}

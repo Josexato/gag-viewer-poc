@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:label="GAG Viewer"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Abrir .gag / .sdjf / .svg desde "Abrir con" -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.gag" />
+                <data android:pathPattern=".*\\.GAG" />
+                <data android:pathPattern=".*\\.sdjf" />
+                <data android:pathPattern=".*\\.SDJF" />
+                <data android:pathPattern=".*\\.svg" />
+                <data android:pathPattern=".*\\.SVG" />
+            </intent-filter>
+
+            <!-- SVG que llega con su MIME correcto -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" android:mimeType="image/svg+xml" />
+                <data android:scheme="file" android:mimeType="image/svg+xml" />
+            </intent-filter>
+
+        </activity>
+    </application>
+
+</manifest>
