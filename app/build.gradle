@@ -40,8 +40,8 @@ chaquopy {
         // Versión de Python embebida (AlmaGag requiere 3.8+).
         version '3.11'
         // Intérprete del host usado en build para resolver pip/empaquetar.
-        // En CI (ubuntu) y en Windows local suele resolverse como 'python3'/'python'.
-        buildPython 'python3', 'python'
+        // En el runner de Ubuntu (setup-python) está disponible como 'python3'.
+        buildPython 'python3'
         pip {
             install 'svgwrite>=1.4'
         }
