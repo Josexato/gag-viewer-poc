@@ -32,6 +32,21 @@
                 <data android:pathPattern=".*\\.SVG" />
             </intent-filter>
 
+            <!-- .gag/.sdjf entregados con MIME genérico (content:// sin
+                 extensión visible): Android filtra por tipo, así que hay
+                 que declararlos; la app ya distingue JSON/SVG por contenido -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" android:mimeType="application/json" />
+                <data android:scheme="file" android:mimeType="application/json" />
+                <data android:scheme="content" android:mimeType="application/octet-stream" />
+                <data android:scheme="file" android:mimeType="application/octet-stream" />
+                <data android:scheme="content" android:mimeType="text/plain" />
+                <data android:scheme="file" android:mimeType="text/plain" />
+            </intent-filter>
+
             <!-- SVG que llega con su MIME correcto -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
