@@ -122,6 +122,13 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
     if n_unions:
         logger.info(f"§H7: {n_unions} union(es) expandida(s) a nodo de barra")
 
+    # §Q63: mapa `semantics` embebido en el archivo (como `icons{}`) — el
+    # motor lo aplica mecánicamente a conexiones SIN semantic_type, con
+    # WARNING; el vocabulario nunca vive en el código. Corre ANTES del tema
+    # para que los colores del mapa puedan ser tokens §O57.
+    from AlmaGag.layout.semantics import apply_embedded_semantics
+    apply_embedded_semantics(data)
+
     # §O57: resolver tokens de tema (`theme` top-level + `"color": "<token>"`)
     # sobre el JSON crudo — el resto del pipeline sólo ve hex/nombres CSS.
     from AlmaGag.layout.theme import apply_theme
@@ -165,6 +172,16 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
     if embedded_icons:
         logger.info(f"{len(embedded_icons)} icono(s) SVG embebido(s) detectado(s)")
 
+    # §Q64: inventario de BWTs activos — types sin icono resoluble. Usarlos
+    # es legítimo (BWT deliberado mientras se decide su representación); el
+    # inventario es la señal de promoción al catálogo (mismo type en ≥2
+    # fixtures). El detalle por elemento lo avisa §O55 al dibujar.
+    from AlmaGag.draw.icons import unresolved_icon_types
+    bwt_types = unresolved_icon_types(data.get('elements', []), embedded_icons)
+    if bwt_types:
+        logger.info(f"§Q64: {len(bwt_types)} type(s) en BWT (inventario para "
+                    f"el catálogo): {', '.join(bwt_types)}")
+
     # Determinar ruta de salida
     if output_file:
         # Usar la ruta proporcionada
@@ -206,6 +223,7 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
     # §I27/§I30: ámbitos por fase (areas) y leyenda de roles (opcionales; sólo
     # los consume el algoritmo hier). Retrocompatible: si faltan, camino normal.
     initial_layout._areas = data.get('areas')
+    initial_layout._flows = data.get('flows')
     initial_layout._roles = data.get('roles')
     initial_layout._lanes = data.get('lanes')
     # §④ consideraciones BLANDAS (align/near/avoid): sólo las consume AUTO y las

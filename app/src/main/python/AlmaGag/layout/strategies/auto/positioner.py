@@ -186,7 +186,11 @@ class AutoLayoutPositioner:
         logger.debug(f"  Contenedores: {len(containers)}")
         logger.debug(f"  Elementos libres: {len(free_elements)}")
 
-        if not containers or not free_elements:
+        # WISH-LAYOUT-009: sin contenedores no hay nada que hacer, pero SIN
+        # LIBRES la resolución contenedor-contenedor sigue siendo necesaria
+        # (un diagrama 100% seccionado — p. ej. template dashboard — quedaba
+        # con cajas montadas tras crecer la grilla label-aware).
+        if not containers:
             logger.debug("  Nada que ajustar")
             return layout
 
@@ -205,6 +209,14 @@ class AutoLayoutPositioner:
 
         MARGIN = SPACING_SMALL  # 40px margin around containers
 
+        # WISH-AUTO-010: un libre MULTI-ZONA (todos sus vecinos dentro de
+        # contenedores, y en ≥2 contenedores distintos) no se deja caer al
+        # fondo del canvas: se coloca en la periferia del bbox de
+        # contenedores, en el lado más cercano al baricentro de sus
+        # vecinos (mismo espíritu que §P60 con las zonas de servicio).
+        self._place_multizone_free_elements(layout, free_elements,
+                                            container_bboxes, MARGIN)
+
         # For each free element, check overlap with containers and shift if needed
         adjustments = 0
         for elem in free_elements:
@@ -222,6 +234,9 @@ class AutoLayoutPositioner:
                     # Shift element below the container
                     old_y = elem['y']
                     elem['y'] = cy2 + MARGIN
+                    # WISH-LAYOUT-008: la etiqueta almacenada viaja con él
+                    self._shift_stored_label(layout, elem['id'], 0,
+                                             elem['y'] - old_y)
                     adjustments += 1
                     logger.debug(f"    {elem['id']}: Y {old_y:.1f} → {elem['y']:.1f} (evitar {cid})")
                     # Re-check with updated position
@@ -243,6 +258,122 @@ class AutoLayoutPositioner:
 
         return layout
 
+    def _place_multizone_free_elements(self, layout, free_elements,
+                                       container_bboxes, margin):
+        """WISH-AUTO-010: libres cuyos vecinos viven TODOS en contenedores
+        (≥2 distintos) van a la periferia del bloque de contenedores, al
+        lado más cercano al baricentro de sus vecinos — no exiliados al
+        fondo con diagonales que cruzan la lámina entera."""
+        # miembro (a cualquier profundidad) → contenedor de primer nivel
+        parent = {}
+        for c in layout.elements:
+            for ref in c.get('contains', []):
+                parent[extract_item_id(ref)] = c['id']
+
+        def _top(eid):
+            seen = set()
+            while eid in parent and eid not in seen:
+                seen.add(eid)
+                eid = parent[eid]
+            return eid
+
+        top_ids = {b[4] for b in container_bboxes}
+        gx1 = min(b[0] for b in container_bboxes)
+        gy1 = min(b[1] for b in container_bboxes)
+        gx2 = max(b[2] for b in container_bboxes)
+        gy2 = max(b[3] for b in container_bboxes)
+
+        placed_boxes = []
+        for elem in free_elements:
+            if 'x' not in elem or 'y' not in elem:
+                continue
+            # sólo aplica al MAL puesto: el que hoy pisa una caja (el
+            # ajuste clásico lo iba a exiliar) o el que ya quedó exiliado
+            # FUERA del hull de contenedores y lejos de sus vecinos; un
+            # libre peninsular bien ubicado no se toca.
+            ew, eh = self.sizing.get_element_size(elem)
+            overlaps = any(
+                elem['x'] < b[2] + margin and elem['x'] + ew > b[0] - margin
+                and elem['y'] < b[3] + margin and elem['y'] + eh > b[1] - margin
+                for b in container_bboxes)
+            outside = (elem['x'] >= gx2 + margin or elem['x'] + ew <= gx1 - margin
+                       or elem['y'] >= gy2 + margin or elem['y'] + eh <= gy1 - margin)
+            if not overlaps and not outside:
+                continue
+            nbr_ids = set()
+            for conn in layout.connections:
+                if conn.get('from') == elem['id']:
+                    nbr_ids.add(conn.get('to'))
+                elif conn.get('to') == elem['id']:
+                    nbr_ids.add(conn.get('from'))
+            nbr_ids.discard(None)
+            if not nbr_ids:
+                continue
+            zones = set()
+            centers = []
+            hosted = True
+            for nid in nbr_ids:
+                ne = layout.elements_by_id.get(nid)
+                if ne is None or 'x' not in ne:
+                    hosted = False
+                    break
+                t = _top(nid)
+                if t == nid or t not in top_ids:
+                    hosted = False       # vecino libre: caso normal
+                    break
+                zones.add(t)
+                centers.append((ne['x'] + ne.get('width', ICON_WIDTH) / 2.0,
+                                ne['y'] + ne.get('height', ICON_HEIGHT) / 2.0))
+            if not hosted or len(zones) < 2:
+                continue
+
+            bx = sum(p[0] for p in centers) / len(centers)
+            by = sum(p[1] for p in centers) / len(centers)
+            if not overlaps:
+                # exiliado = fuera del hull Y lejos del baricentro (más de
+                # media diagonal del hull); si ya está cerca, se respeta
+                ecx, ecy = elem['x'] + ew / 2, elem['y'] + eh / 2
+                half_diag = ((gx2 - gx1) ** 2 + (gy2 - gy1) ** 2) ** 0.5 / 2
+                if ((ecx - bx) ** 2 + (ecy - by) ** 2) ** 0.5 <= half_diag:
+                    continue
+            w, h = self.sizing.get_element_size(elem)
+            # etiqueta de varios renglones: aire extra bajo el icono
+            label_h = self._est_contained_label_height(elem)
+
+            def _clamp(v, lo, hi):
+                return max(lo, min(v, hi))
+
+            candidates = [
+                (_clamp(bx - w / 2, gx1, gx2 - w),
+                 gy1 - margin - h - label_h),                       # arriba
+                (_clamp(bx - w / 2, gx1, gx2 - w), gy2 + margin),   # abajo
+                (gx1 - margin - w - ICON_WIDTH,
+                 _clamp(by - h / 2, gy1, gy2 - h)),                 # izquierda
+                (gx2 + margin + ICON_WIDTH,
+                 _clamp(by - h / 2, gy1, gy2 - h)),                 # derecha
+            ]
+
+            def _cost(pos):
+                cx, cy = pos[0] + w / 2, pos[1] + h / 2
+                return sum(((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                           for px, py in centers)
+
+            nx, ny = min(candidates, key=_cost)
+            # no montarse sobre otro libre ya reubicado
+            for (ox1, oy1, ox2, oy2) in placed_boxes:
+                if nx < ox2 + margin and nx + w > ox1 - margin \
+                        and ny < oy2 + margin and ny + h > oy1 - margin:
+                    nx = ox2 + margin
+            dx, dy = nx - elem['x'], ny - elem['y']
+            if abs(dx) < 0.5 and abs(dy) < 0.5:
+                continue
+            elem['x'], elem['y'] = nx, ny
+            self._shift_stored_label(layout, elem['id'], dx, dy)
+            placed_boxes.append((nx, ny, nx + w, ny + h))
+            logger.debug(f"    {elem['id']}: libre multi-zona → periferia "
+                         f"({nx:.0f}, {ny:.0f}) cerca del baricentro "
+                         f"({bx:.0f}, {by:.0f})")
+
     def _resolve_container_overlaps(self, containers, layout, margin):
         """
         Empuja containers solapados hacia abajo hasta separarlos.
@@ -253,6 +384,24 @@ class AutoLayoutPositioner:
         """
         if len(containers) < 2:
             return
+
+        # BUGS-AUTO-008 (hermano): un contenedor ANIDADO solapa a su ancestro
+        # POR DISEÑO — empujarlo "debajo" lo saca de su padre y rompe la
+        # contención P59. Sólo se separan pares sin relación de ancestría.
+        def _closure(c):
+            acc, stack = set(), [extract_item_id(r) for r in c.get('contains', [])]
+            by = layout.elements_by_id
+            while stack:
+                i = stack.pop()
+                acc.add(i)
+                ch = by.get(i)
+                if ch and 'contains' in ch:
+                    stack.extend(extract_item_id(r) for r in ch['contains'])
+            return acc
+        descendants = {c['id']: _closure(c) for c in containers}
+
+        def _related(a, b):
+            return b['id'] in descendants[a['id']] or a['id'] in descendants[b['id']]
 
         for _ in range(len(containers)):  # iterar varias veces por cascada
             changed = False
@@ -271,7 +420,7 @@ class AutoLayoutPositioner:
                     c2y2 = c2y1 + c2.get('height', ICON_HEIGHT)
                     overlap_x = c1x1 < c2x2 and c2x1 < c1x2
                     overlap_y = c1y1 < c2y2 and c2y1 < c1y2
-                    if overlap_x and overlap_y:
+                    if overlap_x and overlap_y and not _related(c1, c2):
                         # Mover c2 (el más bajo) debajo de c1
                         dy = (c1y2 + margin) - c2y1
                         if dy > 0:
@@ -285,9 +434,15 @@ class AutoLayoutPositioner:
                 break
 
     def _shift_container_subtree(self, container, layout, dx, dy):
-        """Mueve un container + todos sus descendientes por (dx, dy)."""
+        """Mueve un container + todos sus descendientes por (dx, dy).
+
+        WISH-LAYOUT-008: las etiquetas ALMACENADAS viajan con su elemento —
+        con medición veraz, una etiqueta que se queda atrás puntúa «limpia»
+        en el espacio vacío y el diagrama la dibuja huérfana.
+        """
         container['x'] += dx
         container['y'] += dy
+        self._shift_stored_label(layout, container['id'], dx, dy)
         # Mover descendientes recursivamente
         for ref in container.get('contains', []):
             ref_id = extract_item_id(ref)
@@ -298,6 +453,14 @@ class AutoLayoutPositioner:
                 else:
                     child['x'] += dx
                     child['y'] += dy
+                    self._shift_stored_label(layout, ref_id, dx, dy)
+
+    @staticmethod
+    def _shift_stored_label(layout, eid, dx, dy):
+        lp = getattr(layout, 'label_positions', None)
+        if lp and eid in lp:
+            x, y, anchor, baseline = lp[eid]
+            lp[eid] = (x + dx, y + dy, anchor, baseline)
 
     def _calculate_hierarchical_layout(self, layout: Layout, elements: List[dict]):
         """
@@ -335,24 +498,35 @@ class AutoLayoutPositioner:
                 outgoing[f].append(t)
                 incoming[t].append(f)
 
-        # Centrality scores (use resolved connections)
-        centrality = self.graph_analyzer.calculate_centrality_scores(
-            elements, resolved_conns, layout.topological_levels
-        )
+        # U76/J33: una CADENA PURA (cada nivel con un solo eslabón,
+        # consecutivos conectados) apilada por nivel da la tira 1×N que
+        # J33/O51 prohíben. Se pliega en serpentina y se saltan barycenter
+        # y layer-offset (el orden del recorrido ES el orden; el offset por
+        # capa desalinearía los empalmes verticales).
+        folded = self._fold_chain_serpentine(by_level, outgoing, incoming)
+        if folded:
+            by_level, abstract_positions, levels_map = folded
+        else:
+            levels_map = layout.topological_levels
 
-        # 2. Barycenter ordering (reorder elements within each level)
-        self._reorder_by_barycenter(by_level, outgoing, incoming, centrality)
+            # Centrality scores (use resolved connections)
+            centrality = self.graph_analyzer.calculate_centrality_scores(
+                elements, resolved_conns, layout.topological_levels
+            )
 
-        # 3. Assign abstract positions (index within level)
-        abstract_positions = {}
-        for level_num in sorted(by_level.keys()):
-            for idx, elem in enumerate(by_level[level_num]):
-                abstract_positions[elem['id']] = (float(idx), float(level_num))
+            # 2. Barycenter ordering (reorder elements within each level)
+            self._reorder_by_barycenter(by_level, outgoing, incoming, centrality)
 
-        # 4. Optimize abstract positions (layer-offset bisection)
-        abstract_positions = self._optimize_abstract_positions(
-            abstract_positions, by_level, outgoing, incoming
-        )
+            # 3. Assign abstract positions (index within level)
+            abstract_positions = {}
+            for level_num in sorted(by_level.keys()):
+                for idx, elem in enumerate(by_level[level_num]):
+                    abstract_positions[elem['id']] = (float(idx), float(level_num))
+
+            # 4. Optimize abstract positions (layer-offset bisection)
+            abstract_positions = self._optimize_abstract_positions(
+                abstract_positions, by_level, outgoing, incoming
+            )
 
         # 5. Compute real coordinates with global X scale
         TOP_MARGIN = TOP_MARGIN_DEBUG if self.visualdebug else TOP_MARGIN_NORMAL
@@ -417,7 +591,7 @@ class AutoLayoutPositioner:
         for elem in elements:
             eid = elem['id']
             ax = abstract_positions[eid][0]
-            level_num = layout.topological_levels.get(eid, 0)
+            level_num = levels_map.get(eid, 0)
             elem['x'] = (ax + abs_x_shift) * global_x_scale + LEFT_MARGIN
             elem['y'] = level_y.get(level_num, TOP_MARGIN)
 
@@ -430,6 +604,40 @@ class AutoLayoutPositioner:
 
         # Mark hierarchical layout as applied (prevents overwriting by redistribution)
         layout._hierarchical_layout_applied = True
+
+    @staticmethod
+    def _fold_chain_serpentine(by_level, outgoing, incoming):
+        """U76/J33: grafo-cadena → serpentina boustrophedon.
+
+        Si TODOS los niveles tienen exactamente un elemento, hay ≥5
+        eslabones y cada par consecutivo está conectado (en cualquier
+        sentido), la cadena se pliega en filas de ceil(sqrt(2n)) columnas
+        (lámina apaisada ~φ en vez de tira 1×N). Las filas alternan el
+        sentido de recorrido, así cada eslabón queda ADYACENTE al
+        siguiente: horizontal dentro de la fila, vertical en el doblez.
+        Devuelve (by_level, abstract_positions, levels_map) o None."""
+        lv = sorted(by_level.keys())
+        if len(lv) < 5 or any(len(by_level[k]) != 1 for k in lv):
+            return None
+        chain = [by_level[k][0] for k in lv]
+        for a, b in zip(chain, chain[1:]):
+            if b['id'] not in outgoing.get(a['id'], []) \
+                    and b['id'] not in incoming.get(a['id'], []):
+                return None
+        n = len(chain)
+        cols = math.ceil(math.sqrt(2 * n))
+        new_by_level: Dict[int, List[dict]] = {}
+        abstract = {}
+        levels_map = {}
+        for i, e in enumerate(chain):
+            row, col = divmod(i, cols)
+            c = col if row % 2 == 0 else cols - 1 - col
+            abstract[e['id']] = (float(c), float(row))
+            levels_map[e['id']] = row
+            new_by_level.setdefault(row, []).append(e)
+        logger.info(f"    - U76: cadena de {n} eslabones plegada en "
+                    f"serpentina de {cols} columnas")
+        return new_by_level, abstract, levels_map
 
     def _reorder_by_barycenter(
         self,
@@ -986,13 +1194,8 @@ class AutoLayoutPositioner:
         if len(contained_elements) == 1:
             elem = contained_elements[0]
 
-            # Calcular espacio del header del contenedor
-            header_height = 0
-            if container.get('label'):
-                lines = container['label'].split('\n')
-                label_height = len(lines) * TEXT_LINE_HEIGHT  # 18px por línea
-                icon_height = CONTAINER_ICON_HEIGHT  # Altura del icono del contenedor
-                header_height = max(CONTAINER_ICON_HEIGHT, label_height)
+            # BUGS-LAYOUT-011: misma cuenta de header que el layout local
+            header_height = self._container_header_height(container, padding)
 
             # Obtener tamaño del elemento
             elem_width = elem.get('width', ICON_WIDTH)
@@ -1029,6 +1232,26 @@ class AutoLayoutPositioner:
             logger.debug(f"    - {elem['id']}: local({elem.get('_local_x', 0):.1f}, {elem.get('_local_y', 0):.1f}) "
                         f"size({elem.get('width', ICON_WIDTH):.1f} x {elem.get('height', ICON_HEIGHT):.1f})")
 
+    @staticmethod
+    def _container_header_height(container: dict, padding: float) -> float:
+        """BUGS-LAYOUT-011: alto del header de un contenedor, medido desde
+        su techo hasta donde puede empezar el contenido.
+
+        El icono decorativo se DIBUJA en [y+padding, y+padding+50]
+        (draw_container): el header debe llegar hasta su borde inferior
+        real — la cuenta vieja (max(50, label) sin el padding superior)
+        dejaba al primer hijo soldado al icono, y sin label ni siquiera
+        reservaba el icono (hijos encima). Áreas (T73, sin icono) y bands
+        (título lateral) conservan su cuenta."""
+        label_h = 0.0
+        if container.get('label'):
+            label_h = len(container['label'].split('\n')) * TEXT_LINE_HEIGHT
+        if is_band(container):
+            return 0.0
+        if container.get('type', 'building') != 'area':
+            return padding + max(float(CONTAINER_ICON_HEIGHT), label_h)
+        return max(float(CONTAINER_ICON_HEIGHT), label_h) if label_h else 0.0
+
     def _layout_contained_elements_locally(self, container: dict, elements: List[dict]):
         """
         Posiciona elementos DENTRO del contenedor (coordenadas locales).
@@ -1043,17 +1266,8 @@ class AutoLayoutPositioner:
         """
         padding = container.get('padding', CONTAINER_PADDING)
 
-        # Calcular espacio del header del contenedor
-        header_height = 0
-        if container.get('label'):
-            label_text = container['label']
-            lines = label_text.split('\n')
-            label_height = len(lines) * TEXT_LINE_HEIGHT  # 18px por línea
-            icon_height = CONTAINER_ICON_HEIGHT  # Altura del icono del contenedor
-            header_height = max(CONTAINER_ICON_HEIGHT, label_height)
-
         # Posición Y inicial para elementos = header + padding_mid
-        start_y = header_height + padding
+        start_y = self._container_header_height(container, padding) + padding
 
         # Filtrar por scope
         full_elements = []
@@ -1070,9 +1284,15 @@ class AutoLayoutPositioner:
                              if self._get_scope(e, container) == 'full']
             spacing = GRID_SPACING_SMALL
             left = band_left_region(container) + padding
-            for i, elem in enumerate(full_elements):
-                elem['_local_x'] = left + i * (ICON_WIDTH + spacing)
+            # WISH-LAYOUT-009: el avance de la fila es por HIJO — el ancho de
+            # su etiqueta manda sobre el del icono (pitch label-aware).
+            xacc = left
+            for elem in full_elements:
+                cell_w = max(float(ICON_WIDTH),
+                             self._est_contained_label_width(elem))
+                elem['_local_x'] = xacc + (cell_w - float(ICON_WIDTH)) / 2.0
                 elem['_local_y'] = padding
+                xacc += cell_w + spacing
             return
 
         # Layout para elementos "full" (distribución interna simple)
@@ -1088,32 +1308,57 @@ class AutoLayoutPositioner:
 
             spacing = GRID_SPACING_SMALL  # gap horizontal entre celdas
 
-            # K35: la celda se dimensiona al LABEL más ancho de cada columna (no
-            # sólo al ícono) para que las etiquetas multilínea no invadan la
-            # columna vecina (colisiones dentro de «Shared»). SÓLO en grids
-            # angostos (≤2 columnas): en grids anchos, ensanchar cada columna
-            # explotaría el contenedor y descuadraría el layout externo. Ancho
-            # POR COLUMNA (no máximo global). El contenedor crece para alojarlo.
-            widen = cols <= 2
+            # K35 + WISH-LAYOUT-009: la celda se dimensiona al LABEL más ancho
+            # de cada columna (no sólo al ícono) para que las etiquetas no
+            # invadan la columna vecina. Antes sólo en grids angostos (≤2
+            # columnas) — en anchos el pitch de icono fundía filas enteras
+            # (fila de torres del minero, grilla LAF de 06-flujo) y la pasada
+            # global agotaba sus candidatos. Hoy los vecinos SÍ acompañan el
+            # crecimiento (super-nodo rígido §P59 + invariante de solapes +
+            # medición veraz), así que el ensanche es por columna en TODA
+            # grilla. El contenedor crece para alojarlo.
+            #
+            # §P59: la celda se dimensiona además al tamaño REAL del hijo — un
+            # contenedor anidado ya resuelto puede medir cientos de px y el
+            # pitch fijo de icono lo encimaba con sus hermanos. Ancho por
+            # columna y alto por FILA.
+            def _child_w(e):
+                return max(float(e.get('width', ICON_WIDTH)),
+                           self._est_contained_label_width(e))
+
             col_w = {}
+            row_h = {}
             for i, elem in enumerate(full_elements):
-                c = i % cols
-                w = self._est_contained_label_width(elem) if widen else float(ICON_WIDTH)
-                col_w[c] = max(col_w.get(c, float(ICON_WIDTH)), w)
+                c, r = i % cols, i // cols
+                col_w[c] = max(col_w.get(c, float(ICON_WIDTH)), _child_w(elem))
+                row_h[r] = max(row_h.get(r, float(ICON_HEIGHT)),
+                               float(elem.get('height', ICON_HEIGHT)))
             col_left = {}
             xacc = padding
             for c in range(cols):
                 col_left[c] = xacc
                 xacc += col_w.get(c, float(ICON_WIDTH)) + spacing
-            label_h = max((self._est_contained_label_height(e) for e in full_elements),
-                          default=0.0) if widen else 0.0
-            row_pitch = ICON_HEIGHT + max(CONTAINER_GRID_ROW_SPACING, label_h + spacing)
+            # WISH-LAYOUT-009: reserva vertical por FILA — el alto del label
+            # más alto de ESA fila (no un máximo global), para que la fila de
+            # abajo arranque debajo de los textos de la de arriba.
+            row_label_h = {}
+            for i, elem in enumerate(full_elements):
+                r = i // cols
+                row_label_h[r] = max(row_label_h.get(r, 0.0),
+                                     self._est_contained_label_height(elem))
+            row_top = {}
+            yacc = start_y
+            for r in range(max(row_h) + 1):
+                row_top[r] = yacc
+                yacc += row_h[r] + max(CONTAINER_GRID_ROW_SPACING,
+                                       row_label_h.get(r, 0.0) + spacing)
 
             for i, elem in enumerate(full_elements):
                 row = i // cols
                 col = i % cols
-                elem['_local_x'] = col_left[col] + (col_w[col] - ICON_WIDTH) / 2.0
-                elem['_local_y'] = start_y + row * row_pitch
+                ew = float(elem.get('width', ICON_WIDTH))
+                elem['_local_x'] = col_left[col] + (col_w[col] - ew) / 2.0
+                elem['_local_y'] = row_top[row]
 
     @staticmethod
     def _est_contained_label_width(elem: dict) -> float:
@@ -1203,15 +1448,28 @@ class AutoLayoutPositioner:
             content_width = max(content_width, ICON_WIDTH)
             content_height = max(content_height, ICON_HEIGHT)
 
-            # Agregar padding horizontal (izquierda + derecha)
-            base_width = content_width + 2 * padding
+            # WISH-LAYOUT-009: el ancho cubre la EXTENSIÓN local real
+            # (los _local_x son coordenadas dentro del contenedor, no
+            # relativas a min_x): la fórmula content_width + 2·padding
+            # descartaba el origen y el offset de centrado de la primera
+            # columna dejaba al último hijo fuera del borde derecho.
+            base_width = max(max_x + padding, ICON_WIDTH + 2 * padding)
 
         # WISH-LAYOUT-005: band reserva margen lateral para el título rotado
         # + icono (no header arriba) y hugs verticalmente.
+        # WISH-LAYOUT-009: el ancho se mide sobre la EXTENSIÓN local real
+        # (iconos + vuelo horizontal de etiquetas). La fórmula anterior
+        # (content_width + left_region) asumía contenido pegado al margen;
+        # con celdas label-aware el primer icono arranca corrido
+        # (celda−icono)/2 y la banda quedaba corta exactamente ese offset.
         if container is not None and is_band(container):
-            left_region = band_left_region(container)
-            return (content_width + 2 * padding + left_region,
-                    content_height + 2 * padding)
+            right_max = 0.0
+            for e in elements:
+                lx = float(e.get('_local_x', 0.0))
+                ew = float(e.get('width', ICON_WIDTH))
+                lw = self._est_contained_label_width(e)
+                right_max = max(right_max, lx + ew, lx + ew / 2.0 + lw / 2.0)
+            return (right_max + padding, content_height + 2 * padding)
 
         # Calcular espacio del header del contenedor (icono + etiqueta)
         # El header comienza después del padding top

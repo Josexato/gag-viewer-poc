@@ -170,6 +170,13 @@ class AutoLayoutOptimizer(LayoutOptimizer):
                 self._capture('topologia-red', current,
                               f'§N45: banda de hubs + {n_sites} sitio(s)')
 
+        # §P60 (gate temprano): el macro-layout banda/periferia sólo aplica si
+        # las zonas-área top-level NO traen coordenadas del autor. Se evalúa
+        # ANTES del posicionamiento (después todo tiene coords) y se ejecuta
+        # en 2.5.55, con las zonas ya resueltas como super-nodos rígidos.
+        from AlmaGag.layout.strategies.auto.zones import zones_lack_author_coords
+        _p60_eligible = zones_lack_author_coords(current.elements)
+
         self.positioner.calculate_missing_positions(current)
 
         # 0.5. Calcular dimensiones de contenedores (v2.1 FIX)
@@ -228,6 +235,23 @@ class AutoLayoutOptimizer(LayoutOptimizer):
         self._log("Elementos primarios redistribuidos con contenedores expandidos")
         self._capture('contenedores', current,
                       'dimensiones + centrado con etiquetas + redistribución')
+
+        # 2.5.52. §P60: zonas de servicio a la periferia. Con las zonas ya
+        # resueltas y dimensionadas (super-nodos rígidos, P59), la banda
+        # principal queda para las operativas (transporte inter-zona) y las
+        # de servicio bajan a la fila periférica; los enlaces inter-zona se
+        # marcan para rutear por troncales (una por par origen→destino).
+        if _p60_eligible:
+            from AlmaGag.layout.strategies.auto.zones import apply_zone_banding
+            n_svc = apply_zone_banding(
+                current, self.positioner._shift_container_subtree,
+                considerations=getattr(layout, '_considerations', None))
+            if n_svc:
+                # la periferia pudo dejar elementos libres pisando zonas
+                self.positioner.recalculate_positions_with_expanded_containers(current)
+                self._capture('zonas-servicio', current,
+                              f'§P60: banda operativa + {n_svc} zona(s) de '
+                              f'servicio a periferia')
 
         # 2.5.55. §N46: `near[]` como ZONA por construcción. Cada grupo near se
         # clusteriza en grilla compacta en su centroide ANTES del canvas y el
@@ -472,35 +496,44 @@ class AutoLayoutOptimizer(LayoutOptimizer):
         # iconos juntos y labels más anchos que el spacing), escalonar
         # verticalmente y expandir el container para acomodar.
         self._stagger_overlapping_contained_labels(best_layout)
+        # WISH-LAYOUT-008/009: el escalonado y la grilla label-aware EXPANDEN
+        # contenedores — pueden montar cajas entre sí O sobre elementos
+        # libres (invisible para el detector por diseño). Se restauran ambos
+        # invariantes antes del re-ruteo final (que verá geometría sana).
+        self.positioner.recalculate_positions_with_expanded_containers(
+            best_layout)
 
         # H3: normalizar/escalonar movió iconos y expandió contenedores sin
         # re-rutear → las rutas quedaban obsoletas y cruzaban las cajas ya
         # crecidas. Se re-rutea (obstacle-aware, H2) para que las conexiones
-        # rodeen los contenedores en su tamaño final. Guardado: sólo se conserva
-        # si no aumenta las colisiones respecto al layout pre-reruteo.
-        cols_before_reroute = self.evaluate(best_layout)
-        pre_reroute_conns = [dict(c) for c in best_layout.connections]
+        # rodeen los contenedores en su tamaño final.
+        # BUGS-AUTO-009: el re-ruteo es INCONDICIONAL. El guardado que había
+        # aquí comparaba las rutas frescas contra rutas RANCIAS
+        # (pre-normalización), que el renderer luego re-anclaba dibujando
+        # diagonales que ningún evaluador midió — comparación viciada a favor
+        # del material viejo. Sobre la geometría final sólo existe un estado
+        # medible: el re-ruteado.
         best_layout.invalidate_collision_cache()
         self.routing.route(best_layout)
         # H3: re-rutear invalida posiciones de etiqueta (nota del review) → tras
         # el re-ruteo se reubican las etiquetas de icono que hayan quedado
-        # solapadas por las rutas nuevas, antes de decidir si se conserva.
+        # solapadas por las rutas nuevas.
         self._stagger_overlapping_contained_labels(best_layout)
+        # WISH-LAYOUT-009: ese stagger EXPANDE contenedores otra vez — si
+        # montó cajas (entre sí o sobre libres), se restauran los invariantes
+        # y se re-rutea sobre la geometría definitivamente sana.
+        self.positioner.recalculate_positions_with_expanded_containers(
+            best_layout)
+        best_layout.invalidate_collision_cache()
+        self.routing.route(best_layout)
         for _ in range(3):
             if not self._try_relocate_labels(best_layout):
                 break
             best_layout.invalidate_collision_cache()
-        if self.evaluate(best_layout) > cols_before_reroute:
-            # el re-ruteo (con reubicación) empeoró: revertir a las rutas previas
-            for c, saved in zip(best_layout.connections, pre_reroute_conns):
-                c.clear()
-                c.update(saved)
-            best_layout.invalidate_collision_cache()
-        else:
-            self._capture('reruteo', best_layout,
-                          f'rutas obstacle-aware tras layout final · '
-                          f'{count_crossings(best_layout)} cruces · '
-                          f'{self.evaluate(best_layout)} colisiones')
+        self._capture('reruteo', best_layout,
+                      f'rutas obstacle-aware tras layout final · '
+                      f'{count_crossings(best_layout)} cruces · '
+                      f'{self.evaluate(best_layout)} colisiones')
         min_collisions = self.evaluate(best_layout)
 
         # Guardar dump final si está habilitado
@@ -518,8 +551,11 @@ class AutoLayoutOptimizer(LayoutOptimizer):
         # zona (paso 2.5.55); si se clusterizó, sólo align/avoid quedan blandas.
         considerations = getattr(layout, '_considerations', None)
         if considerations:
-            soft = ([c for c in considerations if c['kind'] != 'near']
-                    if n_zones else considerations)
+            # §Q65: la afinidad de áreas ya fue consumida por el banding P60 —
+            # aplicarla blanda movería la caja de zona sin su subárbol.
+            live = [c for c in considerations if not c.get('_zone_affinity')]
+            soft = ([c for c in live if c['kind'] != 'near']
+                    if n_zones else live)
             from AlmaGag.layout.considerations import apply_considerations, label
             best_layout, unmet = apply_considerations(
                 best_layout, soft, self.evaluate, self.routing.route)
@@ -534,6 +570,26 @@ class AutoLayoutOptimizer(LayoutOptimizer):
             self._capture('consideraciones', best_layout,
                           f'{met}/{len(soft)} consideraciones blandas · '
                           f'{n_zones} zona(s) near · {min_collisions} colisiones')
+
+        # §P60: las troncales inter-zona son ESTRUCTURALES (cero diagonales,
+        # H24) — se recalculan sobre la geometría definitiva, después de que
+        # las consideraciones blandas (y su re-ruteo) hayan movido lo último.
+        from AlmaGag.layout.strategies.auto.zones import route_zone_trunks
+        if route_zone_trunks(best_layout):
+            best_layout.invalidate_collision_cache()
+            min_collisions = self.evaluate(best_layout)
+
+        # §P61: pasada anticolisión GLOBAL sobre el árbol completo — última
+        # etapa, con la geometría definitiva (nada se mueve después). Sólo
+        # reubica etiquetas: cruces/arista×nodo/tinta no pueden cambiar.
+        # WISH-LAYOUT-008: el detector mide SIEMPRE la posición almacenada
+        # (medición veraz total), ya no sólo en esta etapa.
+        from AlmaGag.layout.strategies.auto.anticollision import (
+            global_label_anticollision)
+        if global_label_anticollision(best_layout, self.geometry):
+            best_layout.invalidate_collision_cache()
+        best_layout.invalidate_collision_cache()
+        min_collisions = self.evaluate(best_layout)
 
         self._capture('final', best_layout,
                       f'normalizado + labels escalonados · {min_collisions} colisiones')
@@ -560,20 +616,40 @@ class AutoLayoutOptimizer(LayoutOptimizer):
                          e['y'] + e.get('height', ICON_HEIGHT) / 2.0)
                for e in positioned}
 
-        # Membresía en contenedores.
+        # Membresía en contenedores — BUGS-AUTO-008: por CIERRE transitivo
+        # hacia el contenedor TOP-LEVEL. Con la membresía directa, un
+        # contenedor anidado quedaba en DOS bloques (el de su padre y el
+        # suyo) y `node_group` resolvía por último-gana: offsets distintos
+        # para el anidado, sus hijos y el bloque del padre → cizalla que
+        # rompe la contención P59.
         containers = [e for e in layout.elements if 'contains' in e]
+        parent_of: dict = {}
+        for cont in containers:
+            for ref in cont.get('contains', []):
+                parent_of[extract_item_id(ref)] = cont['id']
+
+        def _top_container(eid):
+            seen = set()
+            while eid in parent_of and eid not in seen:
+                seen.add(eid)
+                eid = parent_of[eid]
+            return eid
+
         contained_of: dict = {}
         for cont in containers:
             for ref in cont.get('contains', []):
-                contained_of[extract_item_id(ref)] = cont['id']
+                contained_of[extract_item_id(ref)] = _top_container(cont['id'])
 
-        # Grupos: contenedor+contenido = bloque rígido; §N46 zona near = bloque
-        # rígido (offsets por fila la cizallarían); libres por fila visual.
+        # Grupos: cada contenedor TOP-LEVEL + su subárbol COMPLETO = un solo
+        # bloque rígido (BUGS-AUTO-008); §N46 zona near = bloque rígido
+        # (offsets por fila la cizallarían); libres por fila visual.
         row_h = ICON_HEIGHT
         groups: dict = {}
-        for cont in containers:
-            members = [cont['id']] + [extract_item_id(r) for r in cont.get('contains', [])]
-            groups[('cont', cont['id'])] = [m for m in members if m in pos]
+        top_containers = [c for c in containers if c['id'] not in parent_of]
+        for cont in top_containers:
+            tid = cont['id']
+            members = [tid] + [m for m, top in contained_of.items() if top == tid]
+            groups[('cont', tid)] = [m for m in members if m in pos]
         zone_of: dict = {}
         for e in positioned:
             gi = e.get('_near_zone')
@@ -604,8 +680,18 @@ class AutoLayoutOptimizer(LayoutOptimizer):
         candidate = layout.copy()
         for e in candidate.elements:
             if 'x' in e and e['id'] in node_group:
-                e['x'] += offsets.get(node_group[e['id']], 0.0)
+                off = offsets.get(node_group[e['id']], 0.0)
+                e['x'] += off
+                # WISH-LAYOUT-008: la etiqueta almacenada viaja con su bloque
+                if e['id'] in candidate.label_positions:
+                    lx, ly, an, bl = candidate.label_positions[e['id']]
+                    candidate.label_positions[e['id']] = (lx + off, ly, an, bl)
         candidate.invalidate_collision_cache()
+        # WISH-LAYOUT-008: los offsets por bloque pueden montar contenedores
+        # entre sí o sobre libres (solapes que NI la guarda NI el detector
+        # ven, por diseño). Los invariantes se restauran antes de evaluar.
+        self.positioner.recalculate_positions_with_expanded_containers(
+            candidate)
         self._normalize_to_canvas(candidate)
         self.routing.route(candidate)
 
@@ -1150,16 +1236,14 @@ class AutoLayoutOptimizer(LayoutOptimizer):
         """
         layout.elements_by_id = {e['id']: e for e in layout.elements}
 
-        # CRÍTICO: Recalcular routing PRIMERO (antes de contenedores y etiquetas)
-        # Las conexiones deben reflejar las nuevas posiciones de elementos
-        self.routing.route(layout)
+        # §P61: contenedores PRIMERO, ruteo y etiquetas DESPUÉS. El orden viejo
+        # ruteaba primero "para reflejar las nuevas posiciones" y luego la
+        # re-resolución de contenedores volvía a mover a los contenidos: cada
+        # iteración del loop dejaba rancios los paths (y etiquetas) de todo
+        # miembro de contenedor, y el guardado H3 comparaba rutas frescas
+        # contra ese material rancio.
 
-        self.analyze(layout)
-        layout.label_positions = {}
-        layout.connection_labels = {}
-        self._calculate_initial_positions(layout)
-
-        # CRÍTICO: Recalcular contenedores con centrado (igual que en optimize())
+        # Recalcular contenedores con centrado (igual que en optimize())
         # Limpiar flag _resolved para forzar re-cálculo con centrado
         for elem in layout.elements:
             if 'contains' in elem and elem.get('_resolved'):
@@ -1181,6 +1265,21 @@ class AutoLayoutOptimizer(LayoutOptimizer):
 
         # Propagar coordenadas locales actualizadas (centrado)
         self.positioner._propagate_coordinates_to_contained(layout)
+
+        # WISH-LAYOUT-008/009: los invariantes «contenedores sin solape»
+        # (BUGS-AUTO-004) y «ningún libre sobre un contenedor» deben
+        # sobrevivir a los movimientos del loop — la resolución sólo corría
+        # en el posicionado inicial y un movimiento posterior podía dejar
+        # cajas montadas sin que nadie las separara (el detector no cuenta
+        # container-vs-container ni libre-vs-container por diseño).
+        self.positioner.recalculate_positions_with_expanded_containers(layout)
+
+        # Ruteo y etiquetas sobre las posiciones DEFINITIVAS de esta iteración
+        self.routing.route(layout)
+        self.analyze(layout)
+        layout.label_positions = {}
+        layout.connection_labels = {}
+        self._calculate_initial_positions(layout)
 
     def _stagger_overlapping_contained_labels(self, layout: Layout) -> None:
         """
