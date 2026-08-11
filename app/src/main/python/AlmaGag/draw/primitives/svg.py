@@ -167,8 +167,8 @@ def _generate_color_palette(n):
 # El SDJF puede declarar `connection.semantic_type` y el color se asigna
 # automáticamente. `connection.color` (hex/nombre CSS) tiene precedencia.
 SEMANTIC_CONNECTION_COLORS = {
-    'data_flow':    '#e8820c',  # naranja — flujo de datos
-    'control_flow': '#1f6fd0',  # azul — flujo de control
+    'data_link':    '#e8820c',  # naranja — datos por el enlace
+    'control_link': '#1f6fd0',  # azul — control por el enlace
     'sync':         '#1aa64b',  # verde — sincronización / bidireccional
     'event':        '#8e44ad',  # púrpura — eventos
     'callback':     '#0e8a8a',  # teal — callbacks
@@ -179,8 +179,8 @@ SEMANTIC_CONNECTION_COLORS = {
 
 # §N48: etiquetas cortas para la leyenda de tipos de conexión.
 SEMANTIC_TYPE_LABELS = {
-    'data_flow':    'datos',
-    'control_flow': 'control',
+    'data_link':    'datos',
+    'control_link': 'control',
     'sync':         'sincronización',
     'event':        'eventos',
     'callback':     'callback',
@@ -454,3 +454,39 @@ def draw_connection_labels(dwg, connections, conn_centers,
             center = conn_centers.get(key)
             if center:
                 draw_connection_label(dwg, conn, center)
+
+
+def draw_canvas_legend(dwg, entries, canvas_width, canvas_height, y_offset=0):
+    """WISH-DRAW-004 (V82): `canvas.legend[]` — leyenda LIBRE de primera
+    clase (texto + swatch opcional), en la franja inferior, apilada con
+    las otras leyendas. Reemplaza el hack del flow blanco con path
+    degenerado que U74/U77 caza como error. Entradas: string (sólo texto)
+    o {label, color} (swatch redondo del color). Devuelve True si dibujó."""
+    items = []
+    for e in entries or []:
+        if isinstance(e, str) and e.strip():
+            items.append((e.strip(), None))
+        elif isinstance(e, dict) and e.get('label'):
+            items.append((str(e['label']), e.get('color')))
+    if not items:
+        return False
+
+    legend = dwg.g(class_='ag-bottom-anchored')
+    y = canvas_height - 30 - y_offset
+    x = 24
+    legend.add(dwg.text('Leyenda:', insert=(x, y + 4),
+                        font_size='11px', font_weight='700',
+                        font_family='Arial, sans-serif', fill='#5a5648'))
+    x += 68
+    for label, color in items:
+        if color:
+            legend.add(dwg.circle(center=(x + 6, y), r=5.5,
+                                  fill=color, stroke='#3a362c',
+                                  stroke_width=0.6))
+            x += 18
+        legend.add(dwg.text(label, insert=(x, y + 4),
+                            font_size='11px',
+                            font_family='Arial, sans-serif', fill='#3a362c'))
+        x += 22 + len(label) * 6.8
+    dwg.add(legend)
+    return True

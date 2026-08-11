@@ -476,6 +476,34 @@ class AutoLayoutPositioner:
             layout: Layout con topological_levels calculados
             elements: Elementos sin coordenadas a posicionar
         """
+        resolved_conns = getattr(layout, '_resolved_primary_connections', None) or layout.connections
+
+        # WISH-LAYOUT-014 (V81): un contenedor-FEEDER — toda su relación con
+        # el grafo es UNA arista hacia un nodo primario que no es contenedor
+        # — no ocupa un rango propio (partía el tronco: dppto→ppto a 635px y
+        # el lienzo a 2205). Se aparta del apilado por niveles y al final se
+        # coloca AL COSTADO del rango de su destino.
+        all_ids = {e['id'] for e in elements}
+        by_id = {e['id']: e for e in elements}
+        feeders: Dict[str, str] = {}
+        for e in elements:
+            if 'contains' not in e:
+                continue
+            nbrs = set()
+            for conn in resolved_conns:
+                f, t = conn['from'], conn['to']
+                if f == e['id'] and t in all_ids:
+                    nbrs.add(t)
+                elif t == e['id'] and f in all_ids:
+                    nbrs.add(f)
+            nbrs.discard(e['id'])
+            if len(nbrs) == 1:
+                target = next(iter(nbrs))
+                if 'contains' not in by_id[target]:
+                    feeders[e['id']] = target
+        if feeders and len(feeders) < len(elements):
+            elements = [e for e in elements if e['id'] not in feeders]
+
         # 1. Agrupar por nivel topológico (element dicts, not IDs)
         by_level = {}
         for elem in elements:
@@ -487,8 +515,23 @@ class AutoLayoutPositioner:
         if not by_level:
             return
 
+        # WISH-LAYOUT-012 (V78): `canvas.flow` declara la orientación de
+        # lectura. 'up' (roll-ups: de los recursos al consolidado) invierte
+        # los rangos — fuentes en la banda inferior, sumidero arriba.
+        # Default 'down' (histórico). left/right aún no: warning honesto.
+        flow = str((getattr(layout, 'canvas', None) or {})
+                   .get('flow', 'down')).lower()
+        flow_levels = None
+        if flow in ('left', 'right'):
+            logger.warning(f"§V78: canvas.flow '{flow}' aún no implementado "
+                           f"— se emite con 'down'")
+        elif flow == 'up':
+            mx = max(by_level.keys())
+            by_level = {mx - k: v for k, v in by_level.items()}
+            flow_levels = {e['id']: mx - layout.topological_levels.get(e['id'], 0)
+                           for e in elements}
+
         # Build directed graphs for barycenter (use resolved connections)
-        resolved_conns = getattr(layout, '_resolved_primary_connections', None) or layout.connections
         elem_ids = {e['id'] for e in elements}
         outgoing = {e['id']: [] for e in elements}
         incoming = {e['id']: [] for e in elements}
@@ -507,7 +550,7 @@ class AutoLayoutPositioner:
         if folded:
             by_level, abstract_positions, levels_map = folded
         else:
-            levels_map = layout.topological_levels
+            levels_map = flow_levels or layout.topological_levels
 
             # Centrality scores (use resolved connections)
             centrality = self.graph_analyzer.calculate_centrality_scores(
@@ -601,6 +644,135 @@ class AutoLayoutPositioner:
         if abs(correction) > 0.5:
             for elem in elements:
                 elem['x'] += correction
+
+        # WISH-ROUTE-002 (V80): un eslabón 1:1 entre rangos consecutivos
+        # (padre con esa única arista hacia abajo, hijo con esa única
+        # arista hacia arriba) se alinea a la MISMA columna — la arista
+        # queda vertical pura y el label del padre no convive con un
+        # barrido horizontal (repro: pulab→mo, 161px de desfase). Se mueve
+        # el extremo de grado 1 hacia el otro, sólo si el hueco existe
+        # (pitch label-aware contra los vecinos de su fila).
+        deg = {i: len(outgoing.get(i, [])) + len(incoming.get(i, []))
+               for i in elem_ids}
+        by_row: Dict[int, List[dict]] = {}
+        for e in elements:
+            by_row.setdefault(levels_map.get(e['id'], 0), []).append(e)
+
+        def _center(e):
+            return e['x'] + e.get('width', ICON_WIDTH) / 2.0
+
+        for _ in range(2):
+            for conn in resolved_conns:
+                f, t = conn.get('from'), conn.get('to')
+                if f not in elem_ids or t not in elem_ids or f == t:
+                    continue
+                rf = levels_map.get(f, 0)
+                rt = levels_map.get(t, 0)
+                if abs(rf - rt) != 1:
+                    continue
+                if outgoing.get(f) != [t] or incoming.get(t) != [f]:
+                    continue
+                if deg.get(f) == 1:
+                    free, anchor = by_id[f], by_id[t]
+                elif deg.get(t) == 1:
+                    free, anchor = by_id[t], by_id[f]
+                else:
+                    continue
+                dx = _center(anchor) - _center(free)
+                if abs(dx) < 1.0:
+                    continue
+                new_c = _center(free) + dx
+                row = by_row.get(levels_map.get(free['id'], 0), [])
+                fits = True
+                for other in row:
+                    if other is free:
+                        continue
+                    required = max(
+                        (free.get('width', ICON_WIDTH)
+                         + other.get('width', ICON_WIDTH)) / 2.0 + MIN_GAP,
+                        (label_ws.get(free['id'], 0)
+                         + label_ws.get(other['id'], 0)) / 2.0 + LABEL_GAP)
+                    if abs(new_c - _center(other)) < required:
+                        fits = False
+                        break
+                if fits:
+                    free['x'] += dx
+                    logger.debug(f"    V80: {free['id']} alineado a la "
+                                 f"columna de {anchor['id']} (dx {dx:+.0f})")
+
+        # WISH-LAYOUT-013 (V79): un align de eje x entre RANGOS distintos
+        # es contrato de COLUMNA (dppto/ppto/constr = un solo tronco). El
+        # camino blando no puede honrarlo (mueve todo o nada contra la
+        # guarda de colisiones); aquí se honra en el origen: cada miembro
+        # va a la columna objetivo (mediana) si TODOS tienen hueco en su
+        # fila — pitch label-aware, como el snap V80.
+        for cons in getattr(layout, '_considerations', None) or []:
+            if cons.get('kind') != 'align' or cons.get('axis') != 'x':
+                continue
+            members = [by_id[i] for i in cons.get('ids', [])
+                       if i in by_id and 'x' in by_id[i]
+                       and i in levels_map]
+            if len(members) < 2:
+                continue
+            if len({levels_map.get(m['id'], 0) for m in members}) < 2:
+                continue          # mismo rango: sigue en la vía blanda
+            centers = sorted(_center(m) for m in members)
+            target = centers[len(centers) // 2]
+            moves = []
+            honorable = True
+            for m in members:
+                dx = target - _center(m)
+                if abs(dx) < 1.0:
+                    continue
+                row = by_row.get(levels_map.get(m['id'], 0), [])
+                for other in row:
+                    if other is m:
+                        continue
+                    required = max(
+                        (m.get('width', ICON_WIDTH)
+                         + other.get('width', ICON_WIDTH)) / 2.0 + MIN_GAP,
+                        (label_ws.get(m['id'], 0)
+                         + label_ws.get(other['id'], 0)) / 2.0 + LABEL_GAP)
+                    if abs(target - _center(other)) < required:
+                        honorable = False
+                        break
+                if not honorable:
+                    break
+                moves.append((m, dx))
+            if honorable:
+                for m, dx in moves:
+                    m['x'] += dx
+                if moves:
+                    logger.debug(f"    V79: align x honrado — "
+                                 f"{[m['id'] for m, _ in moves]} → {target:.0f}")
+
+        # WISH-LAYOUT-014: cada feeder va al costado del rango de su
+        # destino — el lado de la arista más corta — fuera de lo ya tendido
+        # en su franja vertical, centrado en su destino. El tronco no se
+        # estira y la arista queda corta y perpendicular al borde.
+        for fid, tid in feeders.items():
+            fc = by_id[fid]
+            tgt = by_id.get(tid)
+            if tgt is None or 'x' not in tgt:
+                continue
+            cw = fc.get('width', ICON_WIDTH)
+            ch = fc.get('height', ICON_HEIGHT)
+            cy = tgt['y'] + tgt.get('height', ICON_HEIGHT) / 2.0 - ch / 2.0
+            band = [e for e in elements if 'x' in e
+                    and e['y'] < cy + ch + MIN_GAP
+                    and e['y'] + e.get('height', ICON_HEIGHT) > cy - MIN_GAP]
+            gap = SPACING_XLARGE          # aire para la arista y los labels
+            right_x = max((e['x'] + e.get('width', ICON_WIDTH) for e in band),
+                          default=tgt['x']) + gap
+            left_x = min((e['x'] for e in band), default=tgt['x']) - gap - cw
+            t_r = tgt['x'] + tgt.get('width', ICON_WIDTH)
+            if right_x - t_r <= tgt['x'] - (left_x + cw):
+                fc['x'] = right_x
+            else:
+                fc['x'] = left_x
+            fc['y'] = cy
+            logger.debug(f"    {fid}: contenedor-feeder al costado de {tid} "
+                         f"({fc['x']:.0f}, {fc['y']:.0f})")
 
         # Mark hierarchical layout as applied (prevents overwriting by redistribution)
         layout._hierarchical_layout_applied = True

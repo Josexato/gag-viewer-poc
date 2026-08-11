@@ -172,7 +172,14 @@ def _group_transform_bbox(g):
     sm = _SCALE_RE.search(tr)
     sx = float(sm.group(1)) if sm else 1.0
     sy = float(sm.group(2)) if sm and sm.group(2) else sx
-    return (tx, ty, tx + _ICON_W * sx, ty + _ICON_H * sy)
+    # BUGS-VAL-006: el scale del transform NORMALIZA el viewBox intrínseco
+    # del icono a la ranura nominal (firewall: 51×43 → ×1.57/×1.16 = 80×50;
+    # embebidos: min(80/w, 50/h)) — ningún emisor magnifica más allá de la
+    # ranura. Multiplicar la ranura por el scale inflaba el bbox (FortiGate:
+    # 125×58 en vez de 80×50 → R1 falso de 512px² contra su PROPIO label).
+    return (tx, ty,
+            tx + min(_ICON_W * sx, _ICON_W),
+            ty + min(_ICON_H * sy, _ICON_H))
 
 
 def _group_children_bbox(g):
@@ -286,6 +293,19 @@ def _collect_icon_bboxes(root):
             continue
         if '_container' in fill or '_box' in fill:
             continue
+        # BUGS-VAL-005: los contenedores se marcan con class="ag-container"
+        # (contrato del renderer) — un contenedor CHICO pasaba el filtro de
+        # tamaño y contaba como icono: todo texto interior daba R1 falso
+        # (zona de 2 miembros: 3×R1 contra 0 con 3-4). Fallback para SVGs
+        # viejos sin la clase: los contenedores dibujan translúcido
+        # (fill-opacity ~0.15), los iconos opacos.
+        if 'ag-container' in rect.get('class', ''):
+            continue
+        try:
+            if float(rect.get('fill-opacity', 1)) < 0.9:
+                continue
+        except (TypeError, ValueError):
+            pass
         try:
             x = float(rect.get('x', 0))
             y = float(rect.get('y', 0))
@@ -378,7 +398,7 @@ def _collect_connection_endpoints(root):
 
     endpoints = []
     for ln in root.iter(f'{{{SVG_NS}}}line'):
-        if ln.get('class') == 'ag-flow':      # WISH-DRAW-002: anotación
+        if ln.get('class') == 'ag-journey':      # WISH-DRAW-002: anotación
             continue
         if not _is_connection_stroke(ln.get('stroke', '')):
             continue
@@ -396,7 +416,7 @@ def _collect_connection_endpoints(root):
         endpoints.append((x1, y1, x2, y2))
 
     for pl in root.iter(f'{{{SVG_NS}}}polyline'):
-        if pl.get('class') == 'ag-flow':      # WISH-DRAW-002: anotación
+        if pl.get('class') == 'ag-journey':      # WISH-DRAW-002: anotación
             continue
         if not _is_connection_stroke(pl.get('stroke', '')):
             continue
