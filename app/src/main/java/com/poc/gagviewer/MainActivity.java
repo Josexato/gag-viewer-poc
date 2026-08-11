@@ -1,7 +1,13 @@
 package com.poc.gagviewer;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Picture;
+import android.graphics.pdf.PdfDocument;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -13,6 +19,8 @@ import android.webkit.WebView;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.Toast;
+
+import java.io.OutputStream;
 
 import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
@@ -28,16 +36,28 @@ import java.util.regex.Pattern;
 public class MainActivity extends Activity {
 
     private static final int REQUEST_OPEN = 1;
+    private static final int REQUEST_SAVE_SVG = 2;
+    private static final int REQUEST_SAVE_PNG = 3;
+    private static final int REQUEST_SAVE_PDF = 4;
 
     private WebView webView;
     private final Handler ui = new Handler(Looper.getMainLooper());
+    // Último diagrama real cargado (no los SVG de estado/aviso).
+    private String currentSvg;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // Necesario ANTES de crear el WebView para poder capturar el
+        // documento completo (no solo lo visible) al exportar PNG/PDF.
+        WebView.enableSlowWholeDocumentDraw();
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout buttonRow = new LinearLayout(this);
+        buttonRow.setOrientation(LinearLayout.HORIZONTAL);
 
         Button openButton = new Button(this);
         openButton.setText("Abrir .gag / .sdjf / .svg");
@@ -47,7 +67,21 @@ public class MainActivity extends Activity {
                 openPicker();
             }
         });
-        root.addView(openButton, new LinearLayout.LayoutParams(
+        buttonRow.addView(openButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f));
+
+        Button exportButton = new Button(this);
+        exportButton.setText("Exportar…");
+        exportButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openExportDialog();
+            }
+        });
+        buttonRow.addView(exportButton, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        root.addView(buttonRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -105,9 +139,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQUEST_OPEN && resultCode == RESULT_OK && data != null
-                && data.getData() != null) {
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        if (requestCode == REQUEST_OPEN) {
             loadFrom(data.getData());
+        } else if (requestCode == REQUEST_SAVE_SVG || requestCode == REQUEST_SAVE_PNG
+                || requestCode == REQUEST_SAVE_PDF) {
+            exportTo(data.getData(), requestCode);
         }
     }
 
@@ -120,6 +159,7 @@ public class MainActivity extends Activity {
         String trimmed = text.trim();
         if (trimmed.startsWith("<")) {
             // Ya es SVG: renderizar directo.
+            currentSvg = text;
             renderSvg(text);
         } else if (trimmed.startsWith("{")) {
             // Es .gag/.sdjf (JSON): convertir con el motor AlmaGag en Python.
@@ -151,11 +191,84 @@ public class MainActivity extends Activity {
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
+                        currentSvg = finalSvg;
                         renderSvg(finalSvg);
                     }
                 });
             }
         }).start();
+    }
+
+    // ---- Exportación SVG / PNG / PDF ----
+
+    private void openExportDialog() {
+        if (currentSvg == null) {
+            Toast.makeText(this, "Abre primero un diagrama", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final String[] options = {"SVG (vector original)", "PNG (imagen)", "PDF (documento)"};
+        new AlertDialog.Builder(this)
+                .setTitle("Exportar como")
+                .setItems(options, (dialog, which) -> {
+                    if (which == 0) {
+                        createDocument("image/svg+xml", "diagrama.svg", REQUEST_SAVE_SVG);
+                    } else if (which == 1) {
+                        createDocument("image/png", "diagrama.png", REQUEST_SAVE_PNG);
+                    } else {
+                        createDocument("application/pdf", "diagrama.pdf", REQUEST_SAVE_PDF);
+                    }
+                })
+                .show();
+    }
+
+    private void createDocument(String mime, String name, int requestCode) {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType(mime);
+        intent.putExtra(Intent.EXTRA_TITLE, name);
+        try {
+            startActivityForResult(intent, requestCode);
+        } catch (Exception e) {
+            Toast.makeText(this, "No se pudo abrir el guardador de archivos", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void exportTo(Uri uri, int requestCode) {
+        try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+            if (requestCode == REQUEST_SAVE_SVG) {
+                out.write(currentSvg.getBytes(StandardCharsets.UTF_8));
+            } else {
+                // Captura del documento completo tal como está renderizado.
+                Picture picture = webView.capturePicture();
+                if (picture == null || picture.getWidth() <= 0 || picture.getHeight() <= 0) {
+                    Toast.makeText(this, "Nada que exportar todavía", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                if (requestCode == REQUEST_SAVE_PNG) {
+                    Bitmap bmp = Bitmap.createBitmap(
+                            picture.getWidth(), picture.getHeight(), Bitmap.Config.ARGB_8888);
+                    Canvas canvas = new Canvas(bmp);
+                    canvas.drawColor(Color.WHITE);
+                    picture.draw(canvas);
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
+                    bmp.recycle();
+                } else {
+                    // El Picture se re-dibuja en el PDF: conserva vectores.
+                    PdfDocument doc = new PdfDocument();
+                    PdfDocument.PageInfo info = new PdfDocument.PageInfo.Builder(
+                            picture.getWidth(), picture.getHeight(), 1).create();
+                    PdfDocument.Page page = doc.startPage(info);
+                    page.getCanvas().drawColor(Color.WHITE);
+                    picture.draw(page.getCanvas());
+                    doc.finishPage(page);
+                    doc.writeTo(out);
+                    doc.close();
+                }
+            }
+            Toast.makeText(this, "Exportado ✔", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Error al exportar: " + e, Toast.LENGTH_LONG).show();
+        }
     }
 
     private synchronized void ensurePython() {
