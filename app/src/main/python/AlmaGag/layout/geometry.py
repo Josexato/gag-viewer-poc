@@ -98,7 +98,7 @@ class GeometryCalculator:
         if position == 'bottom':
             return (center_x, y + height + 20, 'middle', 'bottom')
         elif position == 'top':
-            text_y = y - 10 - ((num_lines - 1) * 18)
+            text_y = y - 10 - ((num_lines - 1) * TEXT_LINE_HEIGHT)
             return (center_x, text_y, 'middle', 'top')
         elif position == 'right':
             return (x + width + 15, center_y, 'start', 'right')
@@ -133,8 +133,8 @@ class GeometryCalculator:
         text_x, text_y, anchor, _ = self.get_text_coords(element, position, num_lines)
 
         # Estimación del tamaño del texto (~8px por caracter en Arial 14px)
-        text_width = max_line_len * 8
-        text_height = num_lines * 18
+        text_width = max_line_len * TEXT_CHAR_WIDTH
+        text_height = num_lines * TEXT_LINE_HEIGHT
 
         # Calcular bbox según anchor
         if anchor == 'middle':
@@ -168,15 +168,15 @@ class GeometryCalculator:
         """§P61: bounding box de la etiqueta en su posición ALMACENADA
         (label_positions), no en la canónica del ancla. Es lo que el renderer
         dibuja (draw_icon_label: primera línea con baseline en (x, y), líneas
-        apiladas a +18px) — el detector debe medir lo que se dibuja, si no los
+        apiladas a +TEXT_LINE_HEIGHT) — el detector debe medir lo que se dibuja, si no los
         escalones anti-fusión resultan invisibles para el contador."""
         label = element.get('label', '')
         if not label or not pos_info:
             return None
         text_x, text_y, anchor, _ = pos_info
         lines = label.split('\n')
-        text_width = max(len(line) for line in lines) * 8
-        text_height = len(lines) * 18
+        text_width = max(len(line) for line in lines) * TEXT_CHAR_WIDTH
+        text_height = len(lines) * TEXT_LINE_HEIGHT
 
         if anchor == 'middle':
             x1 = text_x - text_width // 2
@@ -188,6 +188,27 @@ class GeometryCalculator:
             x1 = text_x - text_width
             x2 = text_x
         return (x1, text_y - 14, x2, text_y - 14 + text_height)
+
+    def get_structural_label_bbox(
+        self,
+        element: dict
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """BUGS-VAL-008 (X93): bbox de la etiqueta ESTRUCTURAL de las vistas
+        agrupadas (§I27/§I28). En esas vistas el renderer no lee
+        `label_positions`: dibuja con `draw_area_node_labels` — centrada bajo
+        el icono, baseline de la primera línea en y+ICON_HEIGHT+14, líneas
+        apiladas a +16px. Este bbox espeja ESA geometría para que el detector
+        mida lo que se dibuja; sin él, el contador `labels` reportaba 0 con
+        decenas de solapes reales (tabernero: 28 pares título↔label-arista)."""
+        label = element.get('label', '')
+        if not label or 'x' not in element or 'y' not in element:
+            return None
+        lines = label.split('\n')
+        cx = element['x'] + ICON_WIDTH / 2
+        top = element['y'] + ICON_HEIGHT + 14      # baseline 1.ª línea
+        width = max(len(line) for line in lines) * TEXT_CHAR_WIDTH
+        return (cx - width / 2, top - 14,
+                cx + width / 2, top + (len(lines) - 1) * 16 + 5)
 
     def get_connection_endpoints(
         self,
@@ -304,6 +325,18 @@ class GeometryCalculator:
         if not label:
             return None
 
+        # WISH-DRAW-007 (X93): los rótulos ANCLADOS (§G23, hier) se dibujan
+        # en `_label_anchor` — el bbox debe medir ESE punto (baseline del
+        # texto en el ancla), no el punto medio del path: lo dibujado es lo
+        # medido. Sin esto el contador reportaba los solapes de anclas en
+        # el lugar equivocado y la cascada era invisible.
+        anchor = connection.get('_label_anchor')
+        text_width = len(label) * 7
+        if anchor:
+            ax, ay = anchor
+            return (ax - text_width // 2, ay - 12,
+                    ax + text_width // 2, ay + 4)
+
         key = f"{connection['from']}->{connection['to']}"
         center = layout.connection_labels.get(
             key,
@@ -312,7 +345,6 @@ class GeometryCalculator:
         mid_x, mid_y = center
 
         # Estimación: 7px por caracter, 12px altura
-        text_width = len(label) * 7
         text_height = 16
 
         return (

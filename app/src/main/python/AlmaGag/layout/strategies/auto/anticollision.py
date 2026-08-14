@@ -153,6 +153,24 @@ def global_label_anticollision(layout, geometry) -> int:
     segs_by_conn = {f"{c['from']}->{c['to']}": _conn_segments(c, layout, geometry)
                     for c in layout.connections}
 
+    # WISH-LAYOUT-018 (W84): la FRANJA de cada journey (sus conexiones
+    # infladas al ancho de banda) es zona a evitar para labels AJENOS al
+    # recorrido — el texto sobre una banda de color de 28px pierde
+    # legibilidad aunque el halo ayude. Aproximación por segmentos de las
+    # conexiones miembro (los empalmes ortogonales no cambian la franja).
+    JOURNEY_HALF = 14.0
+    band_strips: List[Tuple[set, List]] = []
+    for j in (getattr(layout, '_journeys', None) or []):
+        if not isinstance(j, dict):
+            continue
+        ids = [i for i in j.get('path', []) if isinstance(i, str)]
+        segs: List = []
+        for a, b in zip(ids, ids[1:]):
+            segs.extend(segs_by_conn.get(f'{a}->{b}')
+                        or segs_by_conn.get(f'{b}->{a}') or [])
+        if segs:
+            band_strips.append((set(ids), segs))
+
     zone_labels: List[Tuple[float, float, float, float]] = []
     from AlmaGag.layout.considerations import near_zone_boxes
     for zone in near_zone_boxes(layout.elements):
@@ -230,7 +248,7 @@ def global_label_anticollision(layout, geometry) -> int:
                 key, geometry.get_connection_center(layout, c))
             conn_bbox[key] = _conn_label_bbox_at(c['label'], cx, cy)
 
-    def _score(bb, own_id, own_conns) -> int:
+    def _score(bb, own_id, own_conns) -> float:
         # WISH-LAYOUT-010: montarse sobre un ICONO pesa más que rozar otro
         # texto (es la violación R1, la más fea).
         s = 0
@@ -247,8 +265,27 @@ def global_label_anticollision(layout, geometry) -> int:
         for key, cb in conn_bbox.items():
             if key not in own_conns and _intersect(gb, _inflate(cb, TEXT_GAP / 2)):
                 s += 1
+        for members, bsegs in band_strips:
+            if own_id in members:
+                continue
+            if _seg_hits(_inflate(bb, JOURNEY_HALF), bsegs):
+                s += 1
         for key, segs in segs_by_conn.items():
             if key in own_conns:
+                # WISH-ROUTE-004 (W87): el tramo que ATRAVIESA el label de
+                # su propio extremo de lado a lado cuenta (la dashed
+                # resumen→cron cortaba «Cron. Val.» y este score no lo
+                # veía); el roce del stub de puerto (un extremo del
+                # segmento dentro del bbox) sigue exento. Peso 0.5: el
+                # atravesado propio justifica mudarse a un lugar LIMPIO,
+                # nunca crear un solape nuevo (+1) para evitarlo — con
+                # peso entero P61 hacía ese mal trueque en 3 fixtures.
+                def _inside(px, py):
+                    return (bb[0] <= px <= bb[2] and bb[1] <= py <= bb[3])
+                s += 0.5 * sum(1 for sg in segs
+                               if _seg_hits(bb, [sg])
+                               and not _inside(sg[0], sg[1])
+                               and not _inside(sg[2], sg[3]))
                 continue
             s += _seg_hits(bb, segs)
         return s
@@ -304,6 +341,13 @@ def global_label_anticollision(layout, geometry) -> int:
                     bb = geometry.get_label_bbox_stored(e, pos)
                 if not bb:
                     break
+                # It10-4: un candidato con coordenada NEGATIVA muere — el
+                # recorte O51 sólo contrae, nunca expande: un label sobre la
+                # fila superior colocado en y<0 sale CORTADO de la lámina
+                # (el 'top' de cron tras W87). El lienzo crece hacia
+                # abajo/derecha, así que sólo el origen es duro.
+                if cand is not None and (bb[0] < 0 or bb[1] < 0):
+                    continue
                 if (cand is not None and pbox
                         and not (bb[0] >= pbox[0] - 2 and bb[2] <= pbox[2] + 2
                                  and bb[1] >= pbox[1] - 2 and bb[3] <= pbox[3] + 2)):
@@ -398,4 +442,30 @@ def global_label_anticollision(layout, geometry) -> int:
     if moved:
         logger.info(f"§P61: pasada global anticolisión — "
                     f"{moved} etiqueta(s) reubicada(s)")
+
+    # WISH-LAYOUT-018 (W84): lo que quedó bajo una franja AJENA se NOMBRA
+    # — la mitad honesta de siempre: si ningún candidato limpio existió,
+    # el log lo dice en vez de callar.
+    if band_strips:
+        jid_of = {}
+        for j in (getattr(layout, '_journeys', None) or []):
+            if isinstance(j, dict):
+                jid_of[frozenset(i for i in j.get('path', [])
+                                 if isinstance(i, str))] = j.get('id', '?')
+        for e in labeled:
+            eid = e['id']
+            pi = layout.label_positions.get(eid)
+            if not pi:
+                continue
+            bb = geometry.get_label_bbox_stored(e, pi)
+            if not bb:
+                continue
+            for members, bsegs in band_strips:
+                if eid in members:
+                    continue
+                if _seg_hits(_inflate(bb, JOURNEY_HALF), bsegs):
+                    jid = jid_of.get(frozenset(members), '?')
+                    logger.warning(f"[journeys] el label de '{eid}' queda "
+                                   f"bajo la banda de '{jid}' — sin lado "
+                                   f"limpio disponible (W84)")
     return moved

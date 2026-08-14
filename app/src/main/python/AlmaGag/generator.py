@@ -154,6 +154,12 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
                                f"para conservarlo")
                 data['roles'][_k] = {'label': _v}
 
+    # BUGS-VAL-007 (X90): el schema habla — toda clave declarada que el motor
+    # no reconoce se NOMBRA antes de seguir; nunca silencio. Corre sobre el
+    # JSON del autor, antes de que el pipeline inyecte claves internas.
+    from AlmaGag.validation.schema import audit_schema
+    audit_schema(data)
+
     # §H7: expandir `unions` (matrimonio) a nodo de barra + aristas padre→union
     # ANTES de decidir estrategia/template, para que el motor las trate como
     # nodos/aristas normales. No-op si el JSON no declara `unions`.
@@ -259,7 +265,10 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
                    if isinstance(canvas, dict) and canvas.get('flow') else {}),
                 # WISH-DRAW-004 (V82): leyenda libre del autor
                 **({'legend': canvas['legend']}
-                   if isinstance(canvas, dict) and canvas.get('legend') else {})}
+                   if isinstance(canvas, dict) and canvas.get('legend') else {}),
+                # WISH-LAYOUT-021 (X91b): macro-plano declarado del lienzo
+                **({'partition': canvas['partition']}
+                   if isinstance(canvas, dict) and canvas.get('partition') else {})}
     )
 
     # Agregar nombre del diagrama para visualizador
@@ -278,12 +287,13 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
     from AlmaGag.layout.considerations import (
         extract_considerations, areas_to_near_seeds)
     # §O53 (mediano plazo): si el motor quedó en AUTO habiendo `areas` (una
-    # señal blanda las anuló, o el CLI forzó auto), las áreas se siembran
-    # como zonas near §N46 — la caja de fase no se pierde, cambia de traje.
-    # Con `contains` no se convierte (la grilla near asume elementos
-    # normales) y el WARNING §O53 sigue avisando la anulación.
-    if resolved_strategy == 'auto' and data.get('areas') and \
-            not any('contains' in e for e in data.get('elements', [])):
+    # señal las anuló — blanda, `contains`, o el CLI forzó auto), las áreas
+    # se siembran como zonas near §N46 — la caja de fase no se pierde,
+    # cambia de traje. La siembra ya excluye a los miembros CONTENEDORES de
+    # la grilla near (la grilla asume elementos normales), así que la vía
+    # mixta «áreas + contenedores» convive: la fase es zona, el cluster
+    # denso es contenedor.
+    if resolved_strategy == 'auto' and data.get('areas'):
         n_zonas = areas_to_near_seeds(data)
         if n_zonas:
             logger.info(f"§O53: {n_zonas} área(s) sembrada(s) como zona(s) "
@@ -351,8 +361,13 @@ def generate_diagram(json_file, debug=False, visualdebug=False, exportpng=False,
     engine = getattr(optimizer, 'chosen', None) or resolved_strategy or 'auto'
     # §O52: la línea de métricas incluye densidad de tinta y aspecto de la
     # lámina estimada (bbox+margen, espejo del recorte §O51).
+    # BUGS-LOG-001 (hallazgo del Skiller, v3.12): label_own_line se calculaba
+    # (§H6/W87) pero jamás llegaba al log — «leer 4 contadores» era imposible
+    # desde la línea de métricas. Se imprime como canal de diagnóstico; NO
+    # suma al umbral de WARNING (decisión §H6: no es un solape de bboxes).
     line = (f"[{engine}] cruces(arista×arista)={q['edge_x_edge']} "
             f"arista×nodo={q['edge_x_node']} labels={q['label_overlap']} "
+            f"own-line={q['label_own_line']} "
             f"tinta={em['ink_pct']:.1f}% aspecto={em['aspect']:.2f}")
     if q['edge_x_edge'] + q['edge_x_node'] + q['label_overlap'] > 0:
         logger.warning(line)
